@@ -89,7 +89,8 @@ class NemotronStreamer:
 
     def __init__(self, bundle_dir: str | Path, language: str = "auto", latency: str | None = None,
                  num_threads: int = 0, max_symbols: int = 10, low_memory: bool = False,
-                 strip_lang_tags: bool = True, lang_tag_pattern: str | None = None):
+                 strip_lang_tags: bool = True, lang_tag_pattern: str | None = None,
+                 precision: str = "int8"):
         self.dir = Path(bundle_dir)
         self.cfg = json.loads((self.dir / "config.json").read_text())
         self.latency = latency or self.cfg["default_latency"]
@@ -100,6 +101,11 @@ class NemotronStreamer:
         self.blank = int(self.cfg["blank_id"])
         self.max_symbols = max_symbols
         self.strip = strip_lang_tags
+        enc_key = "encoder_fp32_file" if precision == "fp32" else "encoder_file"
+        if enc_key not in self.lat:
+            raise ValueError(f"precision {precision!r} not in bundle; re-export with --keep-fp32"
+                             if precision == "fp32" else f"missing {enc_key} in config")
+        self.encoder_file = self.lat[enc_key]
         # ady/kbd ride the uk-UA/bg-BG prompt slots, so the model emits "<uk-UA>"/"<bg-BG>" — the
         # default NeMo pattern matches those; override if your checkpoint emits something else.
         self.tag_re = re.compile(lang_tag_pattern) if lang_tag_pattern else LANG_TAG_RE
@@ -112,7 +118,7 @@ class NemotronStreamer:
         if low_memory:  # trade a little speed for a smaller resident set
             so.enable_cpu_mem_arena = False
         prov = ["CPUExecutionProvider"]
-        self.enc = ort.InferenceSession(str(self.dir / self.lat["encoder_file"]), so, providers=prov)
+        self.enc = ort.InferenceSession(str(self.dir / self.encoder_file), so, providers=prov)
         self.dec = ort.InferenceSession(str(self.dir / self.cfg["decoder_file"]), so, providers=prov)
 
         self.sp = spm.SentencePieceProcessor()
@@ -228,6 +234,8 @@ def main() -> None:
     ap.add_argument("--language", default="auto", help="prompt key, e.g. auto / ady / kbd / en-US")
     ap.add_argument("--latency", default=None, help="ultra|low|balanced|medium|high (default: bundle default)")
     ap.add_argument("--threads", type=int, default=0, help="intra-op threads (0 = ORT default)")
+    ap.add_argument("--precision", default="int8", choices=["int8", "fp32"],
+                    help="encoder precision (fp32 needs a bundle exported with --keep-fp32)")
     ap.add_argument("--keep-lang-tags", action="store_true", help="do not strip trailing <xx-XX> tags")
     ap.add_argument("--lang-tag-pattern", default=None, help="override the language-tag regex")
     ap.add_argument("--low-memory", action="store_true", help="disable the CPU memory arena")
@@ -236,8 +244,8 @@ def main() -> None:
     asr = NemotronStreamer(args.bundle_dir, language=args.language, latency=args.latency,
                            num_threads=args.threads, low_memory=args.low_memory,
                            strip_lang_tags=not args.keep_lang_tags,
-                           lang_tag_pattern=args.lang_tag_pattern)
-    print(f"[{args.language} @ {asr.latency} = {asr.lat['chunk_ms']} ms]")
+                           lang_tag_pattern=args.lang_tag_pattern, precision=args.precision)
+    print(f"[{args.language} @ {asr.latency} = {asr.lat['chunk_ms']} ms | {args.precision}]")
     print(asr.transcribe(args.audio))
 
 
