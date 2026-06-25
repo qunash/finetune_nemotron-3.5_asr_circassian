@@ -177,6 +177,9 @@ def main() -> None:
                     help="languages used to confirm prompt_index conditioning")
     ap.add_argument("--keep-fp32", action="store_true",
                     help="also keep the FP32 encoders (lets the runtime A/B test INT8 vs FP32)")
+    ap.add_argument("--no-reduce-range", dest="reduce_range", action="store_false",
+                    help="disable INT8 reduce_range (only safe on VNNI/AMX CPUs; default keeps it on)")
+    ap.set_defaults(reduce_range=True)
     args = ap.parse_args()
 
     lats = [s.strip() for s in args.latencies.split(",") if s.strip()]
@@ -348,12 +351,15 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     # --- dynamic INT8 (encoder weights only): MatMul, per-channel, external data. CPU-only. ---
+    # reduce_range keeps weights in [-64, 63] so U8S8 MatMuls don't saturate the int16 accumulator
+    # on non-VNNI CPUs (AVX2) — without it the encoder collapses to garbage on those machines.
     for name, meta in lat_meta.items():
         src = out / meta.pop("_fp32")
         dst = out / meta["encoder_file"]
-        print(f"[{name}] quantizing {src.name} -> {dst.name} (INT8 dynamic, MatMul, per-channel)...")
+        print(f"[{name}] quantizing {src.name} -> {dst.name} "
+              f"(INT8 dynamic, MatMul, per-channel, reduce_range={args.reduce_range})...")
         quantize_dynamic(model_input=str(src), model_output=str(dst),
-                         weight_type=QuantType.QInt8, per_channel=True,
+                         weight_type=QuantType.QInt8, per_channel=True, reduce_range=args.reduce_range,
                          op_types_to_quantize=["MatMul"], use_external_data_format=True)
         if args.keep_fp32:
             meta["encoder_fp32_file"] = src.name
