@@ -32,6 +32,7 @@ import functools
 import gc
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +60,21 @@ def _consolidate(onnx, src: Path, dst: Path) -> None:
                     location=dst.name + ".data", size_threshold=1024)
     del model
     gc.collect()
+
+
+def _export(torch, onnx, wrapper, inputs, in_names, out_names, dyn, dst: Path, opset: int) -> None:
+    """Trace to ONNX inside an isolated temp dir (so a >2 GB model's per-tensor external-data
+    scatter stays contained), consolidate into <dst> + <dst>.data, then drop the temp dir."""
+    tmp = dst.parent / ("_tmp_" + dst.stem)
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    with torch.no_grad():
+        torch.onnx.export(wrapper, inputs, str(tmp / dst.name), input_names=in_names,
+                          output_names=out_names, opset_version=opset, do_constant_folding=True,
+                          dynamo=False, dynamic_axes=dyn)
+    _consolidate(onnx, tmp / dst.name, dst)
+    shutil.rmtree(tmp)
 
 
 def build_encoder_wrapper(torch, model):
@@ -296,7 +312,8 @@ def main() -> None:
     def t(*a, **k):
         return torch.zeros(*a, **k).to(dev)
 
-    # --- encoder ---
+    # --- encoder: export FP32 into an isolated temp dir (a >2 GB model scatters one external file
+    #     per tensor; isolating + rmtree keeps the bundle clean), then verify the prompt + quantize. ---
     print("Exporting encoder...")
     enc_wrap = build_encoder_wrapper(torch, model)
     dummy = {"audio_signal": torch.randn(1, mel_frames, n_mels).to(dev),
@@ -305,9 +322,13 @@ def main() -> None:
              "cache_last_time": t(1, n_layers, d_model, conv_context),
              "cache_last_channel_len": t(1, dtype=torch.int64)}
     lang0 = torch.zeros(1, dtype=torch.int64).to(dev)
-    enc_fp32 = out / "encoder.fp32.onnx"
+    tmp = out / "_tmp_encoder"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir()
+    enc_src = tmp / "encoder.onnx"
     with torch.no_grad():
-        torch.onnx.export(enc_wrap, (*dummy.values(), lang0), str(enc_fp32),
+        torch.onnx.export(enc_wrap, (*dummy.values(), lang0), str(enc_src),
                           input_names=ENC_IN, output_names=ENC_OUT, opset_version=args.opset,
                           do_constant_folding=True, dynamo=False,
                           dynamic_axes={"audio_signal": {0: "batch", 1: "time"}, "length": {0: "batch"},
@@ -317,60 +338,37 @@ def main() -> None:
                                         "cache_last_channel_next": {0: "batch"},
                                         "cache_last_time_next": {0: "batch"},
                                         "cache_last_channel_len_next": {0: "batch"}})
-    enc_fp32_c = out / "encoder.fp32c.onnx"
-    _consolidate(onnx, enc_fp32, enc_fp32_c)
-    for f in out.glob("encoder.fp32.onnx*"):
-        f.unlink()
 
     pd = {k: int(v) for k, v in OmegaConf.to_container(
         model.cfg.model_defaults.prompt_dictionary, resolve=True).items()}
     (out / "prompt_dictionary.json").write_text(json.dumps(pd, indent=2, ensure_ascii=False))
     feed = {k: v.cpu().numpy() for k, v in dummy.items()}
-    verify_prompt(ort, enc_fp32_c, sorted(set(pd.values())), feed)
+    verify_prompt(ort, enc_src, sorted(set(pd.values())), feed)
     print(f"  prompt_dictionary.json written ({len(pd)} languages); ady/kbd ride uk-UA/bg-BG slots")
 
-    # Free torch weights before the (memory-hungry) quantization pass.
-    enc_path = out / "encoder.onnx"
     if args.no_quantize:
-        _consolidate(onnx, enc_fp32_c, enc_path)
+        _consolidate(onnx, enc_src, out / "encoder.onnx")
     else:
         print(f"Quantizing encoder -> INT4 MatMulNBits ({args.quant_method}, block={args.block_size})...")
-        quantize_encoder(enc_fp32_c, enc_path, args.quant_method, args.block_size, args.accuracy_level)
-    for f in out.glob("encoder.fp32c.onnx*"):
-        f.unlink()
+        quantize_encoder(enc_src, out / "encoder.onnx", args.quant_method, args.block_size, args.accuracy_level)
+    shutil.rmtree(tmp)
 
-    # --- decoder ---
+    # --- decoder + joint (tiny, FP32) ---
     print("Exporting decoder...")
-    dec_wrap = build_decoder_wrapper(torch, model.decoder)
-    dec_tmp = out / "decoder.tmp.onnx"
-    with torch.no_grad():
-        torch.onnx.export(dec_wrap, (t(1, 1, dtype=torch.int64), t(dec_layers, 1, dec_hidden),
-                                     t(dec_layers, 1, dec_hidden)), str(dec_tmp),
-                          input_names=["targets", "h_in", "c_in"],
-                          output_names=["decoder_output", "h_out", "c_out"], opset_version=args.opset,
-                          do_constant_folding=True, dynamo=False,
-                          dynamic_axes={"targets": {0: "batch", 1: "target_len"}, "h_in": {1: "batch"},
-                                        "c_in": {1: "batch"}, "decoder_output": {0: "batch", 2: "target_len"},
-                                        "h_out": {1: "batch"}, "c_out": {1: "batch"}})
-    _consolidate(onnx, dec_tmp, out / "decoder.onnx")
-    for f in out.glob("decoder.tmp.onnx*"):
-        f.unlink()
+    _export(torch, onnx, build_decoder_wrapper(torch, model.decoder),
+            (t(1, 1, dtype=torch.int64), t(dec_layers, 1, dec_hidden), t(dec_layers, 1, dec_hidden)),
+            ["targets", "h_in", "c_in"], ["decoder_output", "h_out", "c_out"],
+            {"targets": {0: "batch", 1: "target_len"}, "h_in": {1: "batch"}, "c_in": {1: "batch"},
+             "decoder_output": {0: "batch", 2: "target_len"}, "h_out": {1: "batch"}, "c_out": {1: "batch"}},
+            out / "decoder.onnx", args.opset)
 
-    # --- joint ---
     print("Exporting joint...")
-    joint_wrap = build_joint_wrapper(torch, model.joint)
-    joint_tmp = out / "joint.tmp.onnx"
-    with torch.no_grad():
-        torch.onnx.export(joint_wrap, (torch.randn(1, 1, d_model).to(dev),
-                                       torch.randn(1, 1, dec_hidden).to(dev)), str(joint_tmp),
-                          input_names=["encoder_output", "decoder_output"], output_names=["joint_output"],
-                          opset_version=args.opset, do_constant_folding=True, dynamo=False,
-                          dynamic_axes={"encoder_output": {0: "batch", 1: "time"},
-                                        "decoder_output": {0: "batch", 1: "target_len"},
-                                        "joint_output": {0: "batch", 1: "time", 2: "target_len"}})
-    _consolidate(onnx, joint_tmp, out / "joint.onnx")
-    for f in out.glob("joint.tmp.onnx*"):
-        f.unlink()
+    _export(torch, onnx, build_joint_wrapper(torch, model.joint),
+            (torch.randn(1, 1, d_model).to(dev), torch.randn(1, 1, dec_hidden).to(dev)),
+            ["encoder_output", "decoder_output"], ["joint_output"],
+            {"encoder_output": {0: "batch", 1: "time"}, "decoder_output": {0: "batch", 1: "target_len"},
+             "joint_output": {0: "batch", 1: "time", 2: "target_len"}},
+            out / "joint.onnx", args.opset)
 
     # --- configs + tokenizer ---
     print("Writing configs + tokenizer...")
