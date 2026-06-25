@@ -266,8 +266,16 @@ def main() -> None:
     enc = model.encoder
     n_layers = int(getattr(enc, "num_layers", 24))
     d_model = int(getattr(enc, "d_model", 1024))
-    conv = enc.layers[0].conv.conv
-    conv_context = (conv.kernel_size[0] if isinstance(conv.kernel_size, tuple) else conv.kernel_size) - 1
+    # Causal-conv cache depth = depthwise kernel - 1 (kernel 9 -> 8). genai_config and the encoder
+    # graph must agree, so derive it once here. NeMo names it depthwise_conv on ConformerConvolution.
+    conv_module = enc.layers[0].conv
+    conv_context = 8
+    for _name in ("depthwise_conv", "conv"):
+        _c = getattr(conv_module, _name, None)
+        if _c is not None and hasattr(_c, "kernel_size"):
+            _ks = _c.kernel_size
+            conv_context = (_ks[0] if isinstance(_ks, (tuple, list)) else _ks) - 1
+            break
     chunk_samples = int(args.chunk_size * 16000)
     mel_frames = pre_encode + out_frames * SUBSAMPLING
 
