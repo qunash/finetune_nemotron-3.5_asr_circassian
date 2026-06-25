@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nemotron_stream import log_mel  # NumPy front end shared with the runtime (verified below)
+from nemotron_stream import log_mel, valid_mel_frames  # shared with runtime; verified below
 
 # Right-context -> chunk latency (NVIDIA Nemotron-3.5-ASR model card). Left context is fixed at 56.
 RIGHT_CTX = {"ultra": 0, "low": 1, "balanced": 3, "medium": 6, "high": 13}
@@ -161,22 +161,28 @@ def main() -> None:
     win = int(round(float(pp.window_size) * float(pp.sample_rate)))
     hop = int(round(float(pp.window_stride) * float(pp.sample_rate)))
     n_mels = int(pp.features)
-    preemph = float(pp.get("preemph", 0.97) or 0.97)
-    normalize = str(pp.get("normalize", "NA"))
-    fb = model.preprocessor.featurizer.fb.detach().cpu().numpy().astype(np.float32).reshape(n_mels, -1)
+    featurizer = model.preprocessor.featurizer
+    preemph = float(getattr(featurizer, "preemph", 0.97) or 0.97)
+    mag_power = float(getattr(featurizer, "mag_power", 2.0))
+    log_guard = float(getattr(featurizer, "log_zero_guard_value", LOG_GUARD))
+    normalize = str(getattr(featurizer, "normalize", "NA"))
+    fb = featurizer.fb.detach().cpu().numpy().astype(np.float32).reshape(n_mels, -1)
     fb.tofile(out / "filterbank.bin")
 
-    model.preprocessor.featurizer.dither = 0.0
-    if hasattr(model.preprocessor.featurizer, "pad_to"):
-        model.preprocessor.featurizer.pad_to = 0
+    featurizer.dither = 0.0
+    if hasattr(featurizer, "pad_to"):
+        featurizer.pad_to = 0
     probe = (np.random.RandomState(0).randn(16000 * 2).astype(np.float32)) * 0.1
     with torch.no_grad():
-        mel_nemo, _ = model.preprocessor(input_signal=torch.tensor(probe)[None], length=torch.tensor([len(probe)]))
+        mel_nemo, mel_len = model.preprocessor(
+            input_signal=torch.tensor(probe)[None], length=torch.tensor([len(probe)]))
     mel_nemo = mel_nemo[0].cpu().numpy()
-    mel_np = log_mel(probe, fb, n_fft, hop, win, preemph, LOG_GUARD)
-    cols = min(mel_nemo.shape[1], mel_np.shape[1])
+    valid = int(mel_len[0])  # NeMo zero-fills frames >= this; comparing them inflates max|Δ|
+    mel_np = log_mel(probe, fb, n_fft, hop, win, preemph, log_guard, mag_power)
+    cols = min(valid, mel_nemo.shape[1], mel_np.shape[1])
     mel_diff = float(np.abs(mel_nemo[:, :cols] - mel_np[:, :cols]).max())
-    print(f"mel front-end parity (NumPy vs NeMo): max|Δ| = {mel_diff:.3e}  (normalize={normalize})")
+    print(f"mel front-end parity (NumPy vs NeMo, {cols} valid frames): max|Δ| = {mel_diff:.3e}  "
+          f"(normalize={normalize})")
     if mel_diff > 1e-2:
         raise SystemExit("NumPy mel diverges from NeMo — front end would be wrong; aborting.")
 
@@ -290,7 +296,8 @@ def main() -> None:
         "num_prompts": num_prompts,
         "prompt_dictionary": prompt_dict,
         "mel": {"n_mels": n_mels, "n_fft": n_fft, "win_length": win, "hop_length": hop,
-                "preemph": preemph, "log_guard": LOG_GUARD, "normalize": normalize},
+                "preemph": preemph, "mag_power": mag_power, "log_guard": log_guard,
+                "normalize": normalize},
         "cache": cache_shapes,
         "encoder_inputs": ENC_INPUTS,
         "encoder_outputs": ENC_OUTPUTS,

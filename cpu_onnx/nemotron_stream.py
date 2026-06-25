@@ -30,32 +30,40 @@ LANG_TAG_RE = re.compile(r"\s*<[a-z]{2}-[A-Z]{2}>")
 _ORT_TO_NP = {"tensor(float)": np.float32, "tensor(int64)": np.int64, "tensor(int32)": np.int32}
 
 
+def valid_mel_frames(n_samples: int, n_fft: int, hop: int) -> int:
+    """Mel frames NeMo keeps (FilterbankFeatures.get_seq_len, center=True, exact_pad=False)."""
+    return int(n_samples // hop)
+
+
 def log_mel(audio: np.ndarray, fb: np.ndarray, n_fft: int, hop: int, win: int,
-            preemph: float, guard: float) -> np.ndarray:
-    """NeMo-compatible 128-bin log-mel: preemph -> centered Hann STFT -> power -> mel -> ln(x+guard).
+            preemph: float, guard: float, mag_power: float = 2.0) -> np.ndarray:
+    """NeMo-compatible log-mel: preemph -> torch.stft(center, constant) -> power -> mel -> ln(x+guard).
 
-    Returns band-major features [n_mels, n_frames]. Matches AudioToMelSpectrogramPreprocessor
-    with normalize="NA" and dither=0 (verified against NeMo at export time).
+    Returns band-major [n_mels, n_frames]. Matches FilterbankFeatures with normalize="NA", dither=0.
+    NeMo masks frames beyond get_seq_len to pad_value=0; callers comparing against NeMo should
+    trim with valid_mel_frames() — the last STFT frame is computed but zeroed in NeMo output.
     """
-    audio = np.asarray(audio, dtype=np.float64)
-    pre = np.empty_like(audio)
-    pre[0] = audio[0]
-    pre[1:] = audio[1:] - preemph * audio[:-1]
+    x = np.asarray(audio, dtype=np.float32)
+    pre = np.empty_like(x)
+    pre[0] = x[0]
+    pre[1:] = x[1:] - preemph * x[:-1]
 
-    pad = n_fft // 2
-    pre = np.pad(pre, (pad, pad), mode="reflect")  # center=True, reflect padding
+    # torch.stft(..., center=True, pad_mode="constant") — zeros, not reflect.
+    pre = np.pad(pre, (n_fft // 2, n_fft // 2), mode="constant")
 
     n_frames = 1 + (len(pre) - n_fft) // hop
     idx = np.arange(n_fft)[None, :] + hop * np.arange(n_frames)[:, None]
     frames = pre[idx]
 
-    hann = np.zeros(n_fft, dtype=np.float64)
+    window = np.zeros(n_fft, dtype=np.float32)
     off = (n_fft - win) // 2
-    hann[off:off + win] = 0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(win) / (win - 1)))
-    frames = frames * hann[None, :]
+    window[off:off + win] = np.hanning(win).astype(np.float32)  # periodic=False (NumPy default)
+    frames = frames * window[None, :]
 
-    power = np.abs(np.fft.rfft(frames, n=n_fft, axis=1)) ** 2
-    mel = power @ fb.T.astype(np.float64)
+    mag = np.abs(np.fft.rfft(frames, n=n_fft, axis=1))
+    if mag_power != 1.0:
+        mag = mag ** mag_power
+    mel = mag @ fb.T.astype(np.float32)
     return np.log(mel + guard).T.astype(np.float32)
 
 
@@ -201,7 +209,8 @@ class NemotronStreamer:
 
         self.reset()
         mel = log_mel(audio, self.fb, self.mel["n_fft"], self.mel["hop_length"],
-                      self.mel["win_length"], self.mel["preemph"], self.mel["log_guard"])
+                      self.mel["win_length"], self.mel["preemph"], self.mel["log_guard"],
+                      self.mel.get("mag_power", 2.0))
         ids: list[int] = []
         cursor, frames = 0, mel.shape[1]
         while cursor + shift <= frames:
