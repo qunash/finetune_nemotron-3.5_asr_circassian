@@ -205,8 +205,13 @@ class NemotronStreamer:
             ids += self._decode_frame(encoded[:, :, t:t + 1])
         return ids
 
-    def transcribe(self, audio) -> str:
-        """Transcribe a full clip (path or 16 kHz mono float32) via the streaming loop."""
+    def stream(self, audio):
+        """Yield transcript text incrementally, one delta per processed chunk.
+
+        Re-decodes the growing id list each chunk and emits only the newly appended text, so the
+        deltas concatenate to exactly what ``transcribe`` returns. A possible trailing language
+        tag is held back until the clip ends (it only forms once on the final tokens).
+        """
         if isinstance(audio, (str, Path)):
             audio = load_wav(audio)
         audio = np.asarray(audio, np.float32)
@@ -218,13 +223,24 @@ class NemotronStreamer:
                       self.mel["win_length"], self.mel["preemph"], self.mel["log_guard"],
                       self.mel.get("mag_power", 2.0))
         ids: list[int] = []
+        text, shown = "", ""
         cursor, frames = 0, mel.shape[1]
         while cursor + shift <= frames:
             ids += self.push(mel[:, cursor:cursor + shift])
             cursor += shift
+            text = self.sp.DecodeIds(ids) if ids else ""
+            safe = text[:text.rfind("<")] if (self.strip and "<" in text) else text
+            if len(safe) > len(shown):
+                yield safe[len(shown):]
+                shown = safe
 
-        text = self.sp.DecodeIds(ids) if ids else ""
-        return self.tag_re.sub("", text).strip() if self.strip else text
+        final = self.tag_re.sub("", text).strip() if self.strip else text
+        if len(final) > len(shown):
+            yield final[len(shown):]
+
+    def transcribe(self, audio) -> str:
+        """Transcribe a full clip (path or 16 kHz mono float32) via the streaming loop."""
+        return "".join(self.stream(audio))
 
 
 def main() -> None:
@@ -246,7 +262,9 @@ def main() -> None:
                            strip_lang_tags=not args.keep_lang_tags,
                            lang_tag_pattern=args.lang_tag_pattern, precision=args.precision)
     print(f"[{args.language} @ {asr.latency} = {asr.lat['chunk_ms']} ms | {args.precision}]")
-    print(asr.transcribe(args.audio))
+    for piece in asr.stream(args.audio):
+        print(piece, end="", flush=True)
+    print()
 
 
 if __name__ == "__main__":
