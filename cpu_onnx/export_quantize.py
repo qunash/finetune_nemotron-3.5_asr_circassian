@@ -9,9 +9,10 @@ What it does, grounded in the cache-aware streaming + prompt internals of EncDec
     language), parity-checked against NeMo before writing weights;
   * verifies prompt_index actually conditions the output across multiple languages (catches the
     "prompt baked to one language" failure mode);
-  * exports the RNN-T decoder+joint once (latency-independent), kept FP32;
-  * dynamic INT8-quantizes each encoder (MatMul-only, per-channel, external data) — the decoder
-    stays FP32 because INT8 there hurts accuracy and saves almost nothing;
+  * exports the RNN-T decoder+joint once (latency-independent), kept FP32 by default;
+  * dynamic INT8-quantizes each encoder (MatMul + Conv, per-channel, external data) — quantizing the
+    Conformer convolutions is what brings the encoder down to ~615 MB (matching the smallest public
+    builds); use --quant-ops MatMul to keep convs FP32 if you prefer accuracy headroom;
   * dumps the mel filterbank + a config.json (prompt dictionary, cache shapes, per-latency chunk
     geometry) and verifies the NumPy front end matches NeMo's preprocessor.
 
@@ -179,8 +180,16 @@ def main() -> None:
                     help="also keep the FP32 encoders (lets the runtime A/B test INT8 vs FP32)")
     ap.add_argument("--no-reduce-range", dest="reduce_range", action="store_false",
                     help="disable INT8 reduce_range (only safe on VNNI/AMX CPUs; default keeps it on)")
+    ap.add_argument("--quant-ops", default="MatMul,Conv",
+                    help="op types to INT8-quantize. Default 'MatMul,Conv' also quantizes the "
+                         "Conformer convolutions (~615 MB encoder). Use 'MatMul' to keep convs in "
+                         "FP32 (~885 MB, marginally safer accuracy on low-resource data).")
+    ap.add_argument("--quantize-decoder", action="store_true",
+                    help="also INT8-quantize the decoder_joint (~98 MB -> ~25 MB); slight accuracy "
+                         "risk on the prediction network — off by default")
     ap.set_defaults(reduce_range=True)
     args = ap.parse_args()
+    quant_ops = [s.strip() for s in args.quant_ops.split(",") if s.strip()]
 
     lats = [s.strip() for s in args.latencies.split(",") if s.strip()]
     for n in lats:
@@ -350,22 +359,35 @@ def main() -> None:
     if dev.type == "cuda":
         torch.cuda.empty_cache()
 
-    # --- dynamic INT8 (encoder weights only): MatMul, per-channel, external data. CPU-only. ---
-    # reduce_range keeps weights in [-64, 63] so U8S8 MatMuls don't saturate the int16 accumulator
-    # on non-VNNI CPUs (AVX2) — without it the encoder collapses to garbage on those machines.
+    # --- dynamic INT8 (per-channel, external data). CPU-only. ---
+    # reduce_range keeps weights in [-64, 63] so U8S8 MatMul/Conv kernels don't saturate the int16
+    # accumulator on non-VNNI CPUs (AVX2) — without it the encoder collapses to garbage there.
+    # Quantizing Conv (the Conformer conv module is ~290 MB of FP32 weights) is what shrinks the
+    # encoder from ~885 MB to ~615 MB; it is the default but can be disabled via --quant-ops MatMul.
     for name, meta in lat_meta.items():
         src = out / meta.pop("_fp32")
         dst = out / meta["encoder_file"]
         print(f"[{name}] quantizing {src.name} -> {dst.name} "
-              f"(INT8 dynamic, MatMul, per-channel, reduce_range={args.reduce_range})...")
+              f"(INT8 dynamic, ops={quant_ops}, per-channel, reduce_range={args.reduce_range})...")
         quantize_dynamic(model_input=str(src), model_output=str(dst),
                          weight_type=QuantType.QInt8, per_channel=True, reduce_range=args.reduce_range,
-                         op_types_to_quantize=["MatMul"], use_external_data_format=True)
+                         op_types_to_quantize=quant_ops, use_external_data_format=True)
         if args.keep_fp32:
             meta["encoder_fp32_file"] = src.name
         else:
             for f in src.parent.glob(src.name + "*"):
                 f.unlink()
+
+    decoder_file = "decoder_joint.onnx"
+    if args.quantize_decoder:
+        dec_int8 = out / "decoder_joint.int8.onnx"
+        print(f"quantizing decoder_joint -> {dec_int8.name} (INT8 dynamic, ops={quant_ops})...")
+        quantize_dynamic(model_input=str(out / "decoder_joint.onnx"), model_output=str(dec_int8),
+                         weight_type=QuantType.QInt8, per_channel=True, reduce_range=args.reduce_range,
+                         op_types_to_quantize=quant_ops, use_external_data_format=False)
+        for f in out.glob("decoder_joint.onnx*"):
+            f.unlink()
+        decoder_file = dec_int8.name
 
     config = {
         "model_name": "nemotron-3.5-asr-streaming-0.6b (fine-tuned)",
@@ -381,7 +403,7 @@ def main() -> None:
         "cache": cache_shapes,
         "encoder_inputs": ENC_INPUTS,
         "encoder_outputs": ENC_OUTPUTS,
-        "decoder_file": "decoder_joint.onnx",
+        "decoder_file": decoder_file,
         "latencies": lat_meta,
         "default_latency": lats[0],
     }
