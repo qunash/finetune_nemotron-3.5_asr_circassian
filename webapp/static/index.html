@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Circassian Dictation · Nemotron ASR</title>
+<style>
+  :root {
+    --bg: #0b0f1a;
+    --bg-soft: #121829;
+    --panel: rgba(255, 255, 255, 0.04);
+    --panel-border: rgba(255, 255, 255, 0.08);
+    --text: #e8edf7;
+    --muted: #8a93a8;
+    --accent: #6ea8ff;
+    --accent-2: #8f7bff;
+    --rec: #ff5470;
+    --rec-glow: rgba(255, 84, 112, 0.45);
+    --ok: #34d399;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(1200px 700px at 15% -10%, #1a2340 0%, transparent 55%),
+                radial-gradient(900px 600px at 100% 0%, #2a1a40 0%, transparent 50%),
+                var(--bg);
+    color: var(--text);
+    font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px; overflow: hidden;
+  }
+  .card {
+    width: 100%; max-width: 760px;
+    background: linear-gradient(180deg, var(--panel) 0%, rgba(255,255,255,0.02) 100%);
+    border: 1px solid var(--panel-border);
+    border-radius: 24px; padding: 40px;
+    backdrop-filter: blur(18px);
+    box-shadow: 0 30px 80px rgba(0,0,0,0.45);
+  }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 38px; height: 38px; border-radius: 11px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: grid; place-items: center; font-weight: 700; color: white;
+    box-shadow: 0 8px 22px rgba(110,168,255,0.35);
+  }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
+  .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  .langs { display: flex; gap: 8px; }
+  .lang {
+    appearance: none; border: 1px solid var(--panel-border); cursor: pointer;
+    background: var(--panel); color: var(--text);
+    padding: 9px 14px; border-radius: 999px; font-size: 13px; font-weight: 600;
+    transition: all .18s ease;
+  }
+  .lang .native { opacity: .7; margin-left: 6px; font-weight: 500; }
+  .lang:hover { border-color: rgba(110,168,255,0.5); }
+  .lang.active {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    border-color: transparent; color: white;
+    box-shadow: 0 6px 18px rgba(110,168,255,0.35);
+  }
+  .lang.active .native { opacity: .9; }
+
+  .transcript {
+    min-height: 200px; max-height: 46vh; overflow-y: auto;
+    background: rgba(0,0,0,0.22); border: 1px solid var(--panel-border);
+    border-radius: 16px; padding: 22px; margin-bottom: 26px;
+    font-size: 21px; line-height: 1.55; letter-spacing: 0.2px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .transcript:empty::before {
+    content: "Press the microphone and start speaking…";
+    color: var(--muted); font-size: 16px; font-style: italic;
+  }
+  .cursor { display: inline-block; width: 2px; height: 1.1em; background: var(--accent);
+            vertical-align: text-bottom; margin-left: 1px; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .controls { display: flex; align-items: center; gap: 18px; justify-content: center; }
+  .mic {
+    width: 84px; height: 84px; border-radius: 50%; border: none; cursor: pointer;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: white; display: grid; place-items: center;
+    box-shadow: 0 12px 30px rgba(110,168,255,0.4);
+    transition: transform .15s ease, background .2s ease, box-shadow .2s ease;
+  }
+  .mic:hover { transform: scale(1.04); }
+  .mic:active { transform: scale(0.96); }
+  .mic.recording {
+    background: linear-gradient(135deg, var(--rec), #ff7a5c);
+    box-shadow: 0 0 0 0 var(--rec-glow); animation: pulse 1.6s infinite;
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 var(--rec-glow); }
+    70%  { box-shadow: 0 0 0 22px rgba(255,84,112,0); }
+    100% { box-shadow: 0 0 0 0 rgba(255,84,112,0); }
+  }
+  .mic svg { width: 32px; height: 32px; }
+  .mic.disabled { opacity: .4; cursor: not-allowed; }
+
+  .btn {
+    appearance: none; cursor: pointer; border: 1px solid var(--panel-border);
+    background: var(--panel); color: var(--text);
+    padding: 11px 18px; border-radius: 11px; font-size: 14px; font-weight: 600;
+    transition: all .15s ease;
+  }
+  .btn:hover { border-color: rgba(255,255,255,0.25); background: rgba(255,255,255,0.06); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  .status { display: flex; align-items: center; gap: 8px; justify-content: center;
+            margin-top: 22px; font-size: 12.5px; color: var(--muted); min-height: 18px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--rec); box-shadow: 0 0 10px var(--rec); }
+  .dot.ok   { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+  .dot.warn { background: #f5a623; }
+
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: rgba(20,26,44,0.95); border: 1px solid var(--panel-border);
+    color: var(--text); padding: 12px 20px; border-radius: 12px; font-size: 13.5px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5); opacity: 0; pointer-events: none;
+    transition: opacity .25s ease; max-width: 90vw;
+  }
+  .toast.show { opacity: 1; }
+
+  @media (max-width: 560px) {
+    .card { padding: 24px; }
+    header { flex-direction: column; gap: 16px; align-items: flex-start; }
+    .transcript { font-size: 18px; padding: 16px; }
+    .mic { width: 72px; height: 72px; }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <header>
+      <div class="brand">
+        <div class="logo">C</div>
+        <div>
+          <h1>Circassian Dictation</h1>
+          <div class="sub">Nemotron-3.5-ASR · on-device · ady / kbd</div>
+        </div>
+      </div>
+      <div class="langs" id="langs"></div>
+    </header>
+
+    <div class="transcript" id="transcript"></div>
+
+    <div class="controls">
+      <button class="btn" id="clearBtn" title="Clear transcript">Clear</button>
+      <button class="mic" id="mic" title="Start / stop dictation" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+          <line x1="12" y1="19" x2="12" y2="23"/>
+          <line x1="8" y1="23" x2="16" y2="23"/>
+        </svg>
+      </button>
+      <button class="btn" id="copyBtn" title="Copy transcript">Copy</button>
+    </div>
+
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="statusText">Connecting…</span>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const TARGET_SR = 16000;
+const CHUNK_SAMPLES = 8960;          // matches genai_config.chunk_samples (560 ms)
+const FRAME_MS = CHUNK_SAMPLES / TARGET_SR * 1000;
+
+const langsEl   = document.getElementById("langs");
+const micBtn    = document.getElementById("mic");
+const clearBtn  = document.getElementById("clearBtn");
+const copyBtn   = document.getElementById("copyBtn");
+const transcriptEl = document.getElementById("transcript");
+const dot       = document.getElementById("dot");
+const statusText= document.getElementById("statusText");
+const toast     = document.getElementById("toast");
+
+let currentLang = "ady";
+let ws = null;
+let recording = false;
+let audioCtx = null;
+let workletNode = null;
+let micStream = null;
+let fullText = "";
+
+function showToast(msg, ms = 2600) {
+  toast.textContent = msg;
+  toast.classList.add("show");
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toast.classList.remove("show"), ms);
+}
+
+function setStatus(text, cls) {
+  statusText.textContent = text;
+  dot.className = "dot" + (cls ? " " + cls : "");
+}
+
+// ---- language picker ----
+async function loadLanguages() {
+  try {
+    const r = await fetch("/api/languages");
+    const data = await r.json();
+    langsEl.innerHTML = "";
+    for (const l of data.languages) {
+      const b = document.createElement("button");
+      b.className = "lang" + (l.code === currentLang ? " active" : "");
+      b.dataset.code = l.code;
+      b.innerHTML = `${l.label}<span class="native">${l.native}</span>`;
+      b.addEventListener("click", () => {
+        if (recording) { showToast("Stop recording before switching language"); return; }
+        currentLang = l.code;
+        [...langsEl.children].forEach(c => c.classList.remove("active"));
+        b.classList.add("active");
+      });
+      langsEl.appendChild(b);
+    }
+  } catch (e) {
+    langsEl.innerHTML = '<span style="color:var(--muted);font-size:13px">ady / kbd</span>';
+  }
+}
+
+// ---- websocket ----
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/transcribe`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    micBtn.disabled = false;
+    setStatus("Ready", "ok");
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "ready")   setStatus(`Recording · ${msg.language}`, "live");
+    else if (msg.type === "delta") appendText(msg.text);
+    else if (msg.type === "final") {
+      // Replace the live transcript with the cleaned final version (strips lang tag).
+      fullText = msg.text;
+      renderText(false);
+      setStatus("Ready", "ok");
+    }
+    else if (msg.type === "error") { showToast("Error: " + msg.message); setStatus("Error", "warn"); }
+    else if (msg.type === "reset") { fullText = ""; renderText(false); }
+  };
+  ws.onclose = () => {
+    micBtn.disabled = true;
+    setStatus("Disconnected", "warn");
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = () => setStatus("Connection error", "warn");
+}
+
+// ---- transcript rendering ----
+function appendText(delta) {
+  fullText += delta;
+  renderText(true);
+}
+function renderText(showCursor) {
+  transcriptEl.textContent = fullText;
+  if (showCursor && recording) {
+    const c = document.createElement("span");
+    c.className = "cursor";
+    transcriptEl.appendChild(c);
+  }
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+// ---- audio capture (AudioWorklet, 16 kHz mono float32) ----
+async function startRecording() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { showToast("Not connected"); return; }
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      sampleRate: TARGET_SR,
+    },
+  });
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SR });
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+
+  await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" })));
+  const src = audioCtx.createMediaStreamSource(micStream);
+  workletNode = new AudioWorkletNode(audioCtx, "pcm-publisher", {
+    numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1,
+  });
+  workletNode.port.onmessage = (e) => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data); // Int16Array buffer
+  };
+  src.connect(workletNode);
+
+  ws.send(JSON.stringify({ type: "start", language: currentLang }));
+  recording = true;
+  micBtn.classList.add("recording");
+  setStatus("Starting…");
+}
+
+function stopRecording() {
+  recording = false;
+  micBtn.classList.remove("recording");
+  if (workletNode) { try { workletNode.disconnect(); } catch {} workletNode = null; }
+  if (micStream)   { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (audioCtx)    { audioCtx.close(); audioCtx = null; }
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "stop" }));
+  renderText(false);
+}
+
+micBtn.addEventListener("click", () => {
+  if (recording) stopRecording(); else startRecording().catch(e => {
+    showToast("Microphone error: " + (e.message || e));
+    setStatus("Mic blocked", "warn");
+    recording = false;
+    micBtn.classList.remove("recording");
+  });
+});
+
+clearBtn.addEventListener("click", () => {
+  fullText = "";
+  renderText(false);
+  if (ws && ws.readyState === WebSocket.OPEN && recording) {
+    stopRecording();
+  }
+});
+
+copyBtn.addEventListener("click", async () => {
+  if (!fullText) { showToast("Nothing to copy yet"); return; }
+  try { await navigator.clipboard.writeText(fullText); showToast("Copied to clipboard"); }
+  catch { showToast("Copy failed"); }
+});
+
+// ---- AudioWorklet source: resample-to-16k mono + emit Int16 PCM in CHUNK_SAMPLES frames ----
+const WORKLET_SRC = `
+class PCMPublisher extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buf = new Float32Array(${CHUNK_SAMPLES});
+    this.fill = 0;
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input.length) return true;
+    const ch = input[0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this.buf[this.fill++] = ch[i];
+      if (this.fill >= this.buf.length) {
+        const out = new Int16Array(this.buf.length);
+        for (let j = 0; j < this.buf.length; j++) {
+          let s = Math.max(-1, Math.min(1, this.buf[j]));
+          out[j] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        this.port.postMessage(out.buffer, [out.buffer]);
+        this.fill = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("pcm-publisher", PCMPublisher);
+`;
+
+loadLanguages();
+connect();
+</script>
+</body>
+</html>
